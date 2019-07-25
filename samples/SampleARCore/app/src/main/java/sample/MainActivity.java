@@ -693,13 +693,16 @@ public class MainActivity extends AppCompatActivity
         // Account for any difference between camera sensor orientation and display orientation.
         int rotationDegrees = getCameraSensorToDisplayRotation(this.cameraId);
 
+        // Determine size of the camera preview image.
+        Size size = sharedSession.getCameraConfig().getTextureSize();
+
         // Determine aspect ratio of the output GL surface, accounting for the current display rotation
         // relative to the camera sensor orientation of the device.
         float displayAspectRatio =
                 getCameraSensorRelativeViewportAspectRatio(this.cameraId);
 
         // Render camera preview image to the GL surface.
-        backgroundRenderer.draw(this.captureSize.getWidth(), this.captureSize.getHeight(), displayAspectRatio, rotationDegrees);
+        backgroundRenderer.draw(size.getWidth(), size.getHeight(), displayAspectRatio, rotationDegrees);
     }
 
     // Draw frame when in AR mode. Called on the GL thread.
