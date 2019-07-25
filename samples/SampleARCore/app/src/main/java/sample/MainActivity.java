@@ -41,10 +41,10 @@ import android.util.Size;
 import android.view.Display;
 import android.view.Surface;
 import android.view.WindowManager;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import com.google.ar.core.Anchor;
 import com.google.ar.core.ArCoreApk;
 import com.google.ar.core.Camera;
 import com.google.ar.core.Config;
@@ -74,6 +74,9 @@ public class MainActivity extends AppCompatActivity
         ImageReader.OnImageAvailableListener,
         SurfaceTexture.OnFrameAvailableListener {
     private static final String TAG = MainActivity.class.getSimpleName();
+
+    // Whether the surface texture has been attached to the GL context.
+    boolean isGlAttached;
 
     // GL Surface used to draw camera preview image.
     private GLSurfaceView surfaceView;
@@ -137,17 +140,8 @@ public class MainActivity extends AppCompatActivity
     private int viewportHeight = 0;
     private boolean viewportChanged = false;
     private int displayRotation = 0;
+    private Size captureSize = new Size(640, 480);
 
-
-    private static class ColoredAnchor {
-        public final Anchor anchor;
-        public final float[] color;
-
-        public ColoredAnchor(Anchor a, float[] color4f) {
-            this.anchor = a;
-            this.color = color4f;
-        }
-    }
 
     // Camera device state callback.
     private final CameraDevice.StateCallback cameraDeviceCallback =
@@ -290,9 +284,23 @@ public class MainActivity extends AppCompatActivity
 
         // set anchor button
         findViewById(R.id.anchorButton).setOnClickListener(e -> this.anchorFlag = true);
-
         // set text view
         this.textView = findViewById(R.id.text);
+        // set AR switch button
+        Switch arcoreSwitch = findViewById(R.id.arcore_switch);
+
+        // Ensure initial switch position is set on true
+        arcoreSwitch.setChecked(true);
+        arcoreSwitch.setOnCheckedChangeListener((view, checked) -> {
+            Log.i(TAG, "Switching to " + (checked ? "AR" : "non-AR") + " mode.");
+            if (checked) {
+                resumeARCore();
+            } else {
+                pauseARCore();
+                resumeCamera2();
+            }
+            this.arcoreActive = checked;
+        });
 
     }
 
@@ -329,6 +337,11 @@ public class MainActivity extends AppCompatActivity
         closeCamera();
         stopBackgroundThread();
         super.onPause();
+    }
+
+    private void resumeCamera2() {
+        setRepeatingCaptureRequest();
+        sharedCamera.getSurfaceTexture().setOnFrameAvailableListener(this);
     }
 
     private void resumeARCore() {
@@ -472,12 +485,9 @@ public class MainActivity extends AppCompatActivity
         // Store the ID of the camera used by ARCore.
         cameraId = sharedSession.getCameraConfig().getCameraId();
 
-        // Use the currently configured CPU image size.
-        Size desiredCpuImageSize = sharedSession.getCameraConfig().getImageSize();
         cpuImageReader =
                 ImageReader.newInstance(
-                        desiredCpuImageSize.getWidth(),
-                        desiredCpuImageSize.getHeight(),
+                        this.captureSize.getWidth(), this.captureSize.getHeight(),
                         ImageFormat.YUV_420_888,
                         2);
         cpuImageReader.setOnImageAvailableListener(this, backgroundHandler);
@@ -656,11 +666,40 @@ public class MainActivity extends AppCompatActivity
         }
 
         try {
-            onDrawFrameARCore();
+            if (this.arcoreActive) {
+                onDrawFrameARCore();
+            } else {
+                onDrawFrameCamera2();
+            }
         } catch (Throwable t) {
             // Avoid crashing the application due to unhandled exceptions.
             Log.e(TAG, "Exception on the OpenGL thread", t);
         }
+    }
+
+    // Draw frame when in non-AR mode. Called on the GL thread.
+    public void onDrawFrameCamera2() {
+        SurfaceTexture texture = sharedCamera.getSurfaceTexture();
+
+        // Ensure the surface is attached to the GL context.
+        if (!isGlAttached) {
+            texture.attachToGLContext(backgroundRenderer.getTextureId());
+            isGlAttached = true;
+        }
+
+        // Update the surface.
+        texture.updateTexImage();
+
+        // Account for any difference between camera sensor orientation and display orientation.
+        int rotationDegrees = getCameraSensorToDisplayRotation(this.cameraId);
+
+        // Determine aspect ratio of the output GL surface, accounting for the current display rotation
+        // relative to the camera sensor orientation of the device.
+        float displayAspectRatio =
+                getCameraSensorRelativeViewportAspectRatio(this.cameraId);
+
+        // Render camera preview image to the GL surface.
+        backgroundRenderer.draw(this.captureSize.getWidth(), this.captureSize.getHeight(), displayAspectRatio, rotationDegrees);
     }
 
     // Draw frame when in AR mode. Called on the GL thread.
@@ -673,6 +712,10 @@ public class MainActivity extends AppCompatActivity
         // Perform ARCore per-frame update.
         Frame frame = sharedSession.update();
         Camera camera = frame.getCamera();
+
+        // ARCore attached the surface to GL context using the texture ID we provided
+        // in createCameraPreviewSession() via sharedSession.setCameraTextureName(...).
+        isGlAttached = true;
 
         Pose pose = frame.getAndroidSensorPose();
         // set anchor when anchor button clicked
@@ -691,6 +734,65 @@ public class MainActivity extends AppCompatActivity
         // If frame is ready, render camera preview image to the GL surface.
         backgroundRenderer.draw(frame);
 
+    }
+
+    /**
+     *  Returns the aspect ratio of the GL surface viewport while accounting for the display rotation
+     *  relative to the device camera sensor orientation.
+     */
+    public float getCameraSensorRelativeViewportAspectRatio(String cameraId) {
+        float aspectRatio;
+        int cameraSensorToDisplayRotation = getCameraSensorToDisplayRotation(cameraId);
+        switch (cameraSensorToDisplayRotation) {
+            case 90:
+            case 270:
+                aspectRatio = (float) viewportHeight / (float) viewportWidth;
+                break;
+            case 0:
+            case 180:
+                aspectRatio = (float) viewportWidth / (float) viewportHeight;
+                break;
+            default:
+                throw new RuntimeException("Unhandled rotation: " + cameraSensorToDisplayRotation);
+        }
+        return aspectRatio;
+    }
+
+    /**
+     * Returns the rotation of the back-facing camera with respect to the display. The value is one of
+     * 0, 90, 180, 270.
+     */
+    public int getCameraSensorToDisplayRotation(String cameraId) {
+        CameraCharacteristics characteristics;
+        try {
+            characteristics = this.cameraManager.getCameraCharacteristics(cameraId);
+        } catch (CameraAccessException e) {
+            throw new RuntimeException("Unable to determine display orientation", e);
+        }
+
+        // Camera sensor orientation.
+        int sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+
+        // Current display orientation.
+        int displayOrientation = toDegrees(this.displayRotation);
+
+        // Make sure we return 0, 90, 180, or 270 degrees.
+        return (sensorOrientation - displayOrientation + 360) % 360;
+    }
+
+    private int toDegrees(int rotation) {
+        switch (rotation) {
+            case Surface.ROTATION_0:
+                return 0;
+            case Surface.ROTATION_90:
+                return 90;
+            case Surface.ROTATION_180:
+                return 180;
+            case Surface.ROTATION_270:
+                return 270;
+            default:
+                throw new RuntimeException("Unknown rotation " + rotation);
+        }
     }
 
     private boolean isARCoreSupportedAndUpToDate() {
