@@ -13,7 +13,7 @@
  * limitations under the License.
  */
 
-package sample;
+package main;
 
 import android.content.Context;
 import android.graphics.ImageFormat;
@@ -66,6 +66,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
+import sample.R;
 import sample.rendering.BackgroundRenderer;
 import sample.rendering.CameraPermissionHelper;
 
